@@ -28,32 +28,42 @@ st.set_page_config(
 # If secrets are not configured the app works normally without caching.
 # =============================================================================
 
-def _redis_request(method, path, body=None):
-    """Make a raw REST request to Upstash Redis. Returns parsed JSON or None."""
+def _upstash_credentials():
+    """Return (base_url, token) from Streamlit secrets, or (None, None)."""
     try:
         secrets  = st.secrets.get("upstash", {})
         base_url = secrets.get("UPSTASH_REDIS_REST_URL", "").rstrip("/")
         token    = secrets.get("UPSTASH_REDIS_REST_TOKEN", "")
-        if not base_url or not token:
+        return (base_url, token) if base_url and token else (None, None)
+    except Exception:
+        return None, None
+
+def _redis_cmd(*args):
+    """
+    Execute an Upstash Redis REST command.
+    Uses the pipeline-style URL: POST /COMMAND/arg1/arg2/...
+    This avoids any body serialization issues — all args go in the URL path.
+    Returns the parsed response dict, or None on failure.
+    """
+    try:
+        base_url, token = _upstash_credentials()
+        if not base_url:
             return None
-        url  = f"{base_url}{path}"
-        data = json.dumps(body).encode() if body else None
+        # Build path: /CMD/arg1/arg2 with each arg URL-encoded
+        path = "/" + "/".join(urllib.parse.quote(str(a), safe="") for a in args)
         req  = urllib.request.Request(
-            url, data=data, method=method,
-            headers={
-                "Authorization": f"Bearer {token}",
-                "Content-Type":  "application/json",
-            }
+            base_url + path,
+            method="GET",
+            headers={"Authorization": f"Bearer {token}"},
         )
         with urllib.request.urlopen(req, timeout=3) as r:
             return json.loads(r.read().decode())
     except Exception:
-        return None   # cache failure is always silent
+        return None
 
-def _cache_get(doi):
-    """Return cached CrossRef message dict for this DOI, or None if not cached."""
-    key    = "cf:doi:" + doi.strip().lower()
-    result = _redis_request("GET", f"/get/{urllib.parse.quote(key, safe='')}")
+def _cache_get(key):
+    """Return deserialized value for key, or None."""
+    result = _redis_cmd("GET", key)
     if result and result.get("result"):
         try:
             return json.loads(result["result"])
@@ -61,35 +71,39 @@ def _cache_get(doi):
             return None
     return None
 
-def _cache_set(doi, msg):
-    """Store CrossRef message dict in Redis. Silent on failure."""
-    key  = "cf:doi:" + doi.strip().lower()
-    data = json.dumps(msg, separators=(",", ":"))
-    _redis_request("POST", f"/set/{urllib.parse.quote(key, safe='')}", body=data)
+def _cache_set(key, value, ex=None):
+    """Serialize value to JSON and store in Redis. Optional TTL in seconds."""
+    encoded = json.dumps(value, separators=(",", ":"))
+    if ex:
+        _redis_cmd("SET", key, encoded, "EX", ex)
+    else:
+        _redis_cmd("SET", key, encoded)
 
 def _search_cache_key(params):
     """Stable cache key for a search query dict."""
     stable = json.dumps(params, sort_keys=True)
     return "cf:search:" + hashlib.md5(stable.encode()).hexdigest()
 
+def _cache_get_doi(doi):
+    """Return cached CrossRef message dict for this DOI, or None."""
+    return _cache_get("cf:doi:" + doi.strip().lower())
+
+def _cache_set_doi(doi, msg):
+    """Store CrossRef message dict. No expiry — metadata doesn't change."""
+    _cache_set("cf:doi:" + doi.strip().lower(), msg)
+
 def _search_cache_get(params):
     """Return cached search results list, or None."""
-    key    = _search_cache_key(params)
-    result = _redis_request("GET", f"/get/{urllib.parse.quote(key, safe='')}")
-    if result and result.get("result"):
-        try:
-            return json.loads(result["result"])
-        except Exception:
-            return None
-    return None
+    return _cache_get(_search_cache_key(params))
 
 def _search_cache_set(params, items):
-    """Cache search results. Silent on failure."""
-    key  = _search_cache_key(params)
-    data = json.dumps(items, separators=(",", ":"))
-    # Search results cached for 7 days (TTL in seconds)
-    _redis_request("POST", f"/set/{urllib.parse.quote(key, safe='')}", body=data)
-    _redis_request("POST", f"/expire/{urllib.parse.quote(key, safe='')}", body=604800)
+    """Cache search results for 7 days."""
+    _cache_set(_search_cache_key(params), items, ex=604800)
+
+def _redis_ping():
+    """Return True if Redis is reachable."""
+    result = _redis_cmd("PING")
+    return result is not None
 
 def _cache_stats():
     """Return (hits, misses) from this session, stored in st.session_state."""
@@ -101,15 +115,15 @@ def _cache_stats():
 
 def cached_fetch_by_doi(doi):
     """fetch_by_doi with Redis cache. Returns (msg, raw_doi)."""
-    raw = doi.strip().lstrip("https://doi.org/").lstrip("http://dx.doi.org/")
-    cached = _cache_get(raw)
+    raw    = doi.strip().lstrip("https://doi.org/").lstrip("http://dx.doi.org/")
+    cached = _cache_get_doi(raw)
     if cached is not None:
         st.session_state.cache_hits = st.session_state.get("cache_hits", 0) + 1
         return cached, raw
     st.session_state.cache_misses = st.session_state.get("cache_misses", 0) + 1
     msg, rd = fetch_by_doi(doi)
-    if msg:
-        _cache_set(rd, msg)
+    if msg and rd:
+        _cache_set_doi(rd, msg)
     return msg, rd
 
 def cached_search_crossref(params, rows=3):
@@ -406,7 +420,7 @@ with st.sidebar:
             f"</span>",
             unsafe_allow_html=True,
         )
-    elif _redis_request("GET", "/ping") is not None:
+    elif _redis_ping():
         st.markdown("---")
         st.markdown(
             "<span style='color:#78716c;font-size:0.75rem;'>"
