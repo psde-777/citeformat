@@ -4,7 +4,7 @@ Run with:  streamlit run citeformat_app.py
 """
 
 import streamlit as st
-import sys, io, os, tempfile, datetime, base64
+import sys, io, os, tempfile, datetime, base64, json, hashlib, urllib.request, urllib.parse
 
 # ── Must be first Streamlit call ─────────────────────────────────────────────
 st.set_page_config(
@@ -13,6 +13,116 @@ st.set_page_config(
     layout="wide",
     initial_sidebar_state="expanded",
 )
+
+# =============================================================================
+# REDIS CACHE LAYER
+# =============================================================================
+# Uses Upstash Redis via REST API for shared persistent caching.
+# Set UPSTASH_REDIS_REST_URL and UPSTASH_REDIS_REST_TOKEN in
+# Streamlit Cloud → App settings → Secrets, like:
+#
+#   [upstash]
+#   UPSTASH_REDIS_REST_URL = "https://xxx.upstash.io"
+#   UPSTASH_REDIS_REST_TOKEN = "your-token"
+#
+# If secrets are not configured the app works normally without caching.
+# =============================================================================
+
+def _redis_request(method, path, body=None):
+    """Make a raw REST request to Upstash Redis. Returns parsed JSON or None."""
+    try:
+        secrets  = st.secrets.get("upstash", {})
+        base_url = secrets.get("UPSTASH_REDIS_REST_URL", "").rstrip("/")
+        token    = secrets.get("UPSTASH_REDIS_REST_TOKEN", "")
+        if not base_url or not token:
+            return None
+        url  = f"{base_url}{path}"
+        data = json.dumps(body).encode() if body else None
+        req  = urllib.request.Request(
+            url, data=data, method=method,
+            headers={
+                "Authorization": f"Bearer {token}",
+                "Content-Type":  "application/json",
+            }
+        )
+        with urllib.request.urlopen(req, timeout=3) as r:
+            return json.loads(r.read().decode())
+    except Exception:
+        return None   # cache failure is always silent
+
+def _cache_get(doi):
+    """Return cached CrossRef message dict for this DOI, or None if not cached."""
+    key    = "cf:doi:" + doi.strip().lower()
+    result = _redis_request("GET", f"/get/{urllib.parse.quote(key, safe='')}")
+    if result and result.get("result"):
+        try:
+            return json.loads(result["result"])
+        except Exception:
+            return None
+    return None
+
+def _cache_set(doi, msg):
+    """Store CrossRef message dict in Redis. Silent on failure."""
+    key  = "cf:doi:" + doi.strip().lower()
+    data = json.dumps(msg, separators=(",", ":"))
+    _redis_request("POST", f"/set/{urllib.parse.quote(key, safe='')}", body=data)
+
+def _search_cache_key(params):
+    """Stable cache key for a search query dict."""
+    stable = json.dumps(params, sort_keys=True)
+    return "cf:search:" + hashlib.md5(stable.encode()).hexdigest()
+
+def _search_cache_get(params):
+    """Return cached search results list, or None."""
+    key    = _search_cache_key(params)
+    result = _redis_request("GET", f"/get/{urllib.parse.quote(key, safe='')}")
+    if result and result.get("result"):
+        try:
+            return json.loads(result["result"])
+        except Exception:
+            return None
+    return None
+
+def _search_cache_set(params, items):
+    """Cache search results. Silent on failure."""
+    key  = _search_cache_key(params)
+    data = json.dumps(items, separators=(",", ":"))
+    # Search results cached for 7 days (TTL in seconds)
+    _redis_request("POST", f"/set/{urllib.parse.quote(key, safe='')}", body=data)
+    _redis_request("POST", f"/expire/{urllib.parse.quote(key, safe='')}", body=604800)
+
+def _cache_stats():
+    """Return (hits, misses) from this session, stored in st.session_state."""
+    if "cache_hits"   not in st.session_state: st.session_state.cache_hits   = 0
+    if "cache_misses" not in st.session_state: st.session_state.cache_misses = 0
+    return st.session_state.cache_hits, st.session_state.cache_misses
+
+# ── Cached wrappers ───────────────────────────────────────────────────────────
+
+def cached_fetch_by_doi(doi):
+    """fetch_by_doi with Redis cache. Returns (msg, raw_doi)."""
+    raw = doi.strip().lstrip("https://doi.org/").lstrip("http://dx.doi.org/")
+    cached = _cache_get(raw)
+    if cached is not None:
+        st.session_state.cache_hits = st.session_state.get("cache_hits", 0) + 1
+        return cached, raw
+    st.session_state.cache_misses = st.session_state.get("cache_misses", 0) + 1
+    msg, rd = fetch_by_doi(doi)
+    if msg:
+        _cache_set(rd, msg)
+    return msg, rd
+
+def cached_search_crossref(params, rows=3):
+    """search_crossref with Redis cache. Returns list of candidate dicts."""
+    cached = _search_cache_get(params)
+    if cached is not None:
+        st.session_state.cache_hits = st.session_state.get("cache_hits", 0) + 1
+        return cached
+    st.session_state.cache_misses = st.session_state.get("cache_misses", 0) + 1
+    results = search_crossref(params, rows=rows)
+    if results:
+        _search_cache_set(params, results)
+    return results
 
 # ── Import all logic from citeformat.py (must be in the same folder) ─────────
 try:
@@ -285,6 +395,26 @@ with st.sidebar:
         unsafe_allow_html=True,
     )
 
+    # Cache stats
+    hits, misses = _cache_stats()
+    if hits + misses > 0:
+        pct = int(100 * hits / (hits + misses))
+        st.markdown("---")
+        st.markdown(
+            f"<span style='color:#78716c;font-size:0.75rem;'>"
+            f"Cache: {hits} hits · {misses} misses · {pct}% saved"
+            f"</span>",
+            unsafe_allow_html=True,
+        )
+    elif _redis_request("GET", "/ping") is not None:
+        st.markdown("---")
+        st.markdown(
+            "<span style='color:#78716c;font-size:0.75rem;'>"
+            "Cache: connected ✓"
+            "</span>",
+            unsafe_allow_html=True,
+        )
+
 
 # =============================================================================
 # MAIN AREA
@@ -394,7 +524,7 @@ def _process_all_auto(lines, fmt_fn, fmt_label):
         info = detect_input_type(line)
 
         if info["type"] == "doi":
-            msg, raw_doi = fetch_by_doi(info["doi"])
+            msg, raw_doi = cached_fetch_by_doi(info["doi"])
             if msg:
                 doi_key = raw_doi.strip().lower()
                 if doi_key in seen_dois:
@@ -408,7 +538,7 @@ def _process_all_auto(lines, fmt_fn, fmt_label):
                 entries.append((f"[Could not retrieve: {line}]", []))
         else:
             params     = build_query(info)
-            candidates = search_crossref(params, rows=3)
+            candidates = cached_search_crossref(params, rows=3)
 
             if not candidates:
                 entries.append((f"[No results found: {line}]", []))
@@ -419,7 +549,7 @@ def _process_all_auto(lines, fmt_fn, fmt_label):
                 if doi_key and doi_key in seen_dois:
                     entries.append((f"[Duplicate: {line}]", []))
                 else:
-                    full, rd = fetch_by_doi(raw_doi)
+                    full, rd = cached_fetch_by_doi(raw_doi)
                     msg     = full if full else c
                     rd      = rd  if rd   else raw_doi
                     if rd:
@@ -537,7 +667,7 @@ if st.session_state.get("ambiguous") and not st.session_state.done:
                                 f"[Duplicate: {item['line']}]", []
                             )
                         else:
-                            full, rd = fetch_by_doi(raw_doi)
+                            full, rd = cached_fetch_by_doi(raw_doi)
                             msg      = full if full else c
                             rd       = rd   if rd   else raw_doi
                             authors_meta = msg.get("author", [])
