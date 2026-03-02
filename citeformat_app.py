@@ -4,7 +4,7 @@ Run with:  streamlit run citeformat_app.py
 """
 
 import streamlit as st
-import sys, io, os, tempfile, datetime, base64
+import sys, io, os, tempfile, datetime, base64, json, hashlib, urllib.request, urllib.parse, re
 
 # ── Must be first Streamlit call ─────────────────────────────────────────────
 st.set_page_config(
@@ -13,6 +13,350 @@ st.set_page_config(
     layout="wide",
     initial_sidebar_state="expanded",
 )
+
+# =============================================================================
+# REDIS CACHE LAYER
+# =============================================================================
+# Uses Upstash Redis via REST API for shared persistent caching.
+# Set UPSTASH_REDIS_REST_URL and UPSTASH_REDIS_REST_TOKEN in
+# Streamlit Cloud → App settings → Secrets, like:
+#
+#   [upstash]
+#   UPSTASH_REDIS_REST_URL = "https://xxx.upstash.io"
+#   UPSTASH_REDIS_REST_TOKEN = "your-token"
+#
+# If secrets are not configured the app works normally without caching.
+# =============================================================================
+
+# =============================================================================
+# BIBTEX CACHE HELPERS
+# =============================================================================
+# We store only the fields needed for citation formatting as a compact BibTeX
+# string. Key = "bib:<doi>" (lowercase). This is ~10x smaller than raw CrossRef
+# JSON and human-readable in the Upstash Data Browser.
+#
+# BibTeX field set stored:
+#   doi, title, author (Last, F. and ...), journal, year, volume, number,
+#   pages, publisher
+#
+# On read we parse back to a CrossRef-compatible dict so the rest of the
+# app needs no changes.
+# =============================================================================
+
+def _upstash_credentials():
+    """Return (base_url, token) from Streamlit secrets, or (None, None)."""
+    try:
+        secrets  = st.secrets.get("upstash", {})
+        base_url = secrets.get("UPSTASH_REDIS_REST_URL", "").rstrip("/")
+        token    = secrets.get("UPSTASH_REDIS_REST_TOKEN", "")
+        return (base_url, token) if base_url and token else (None, None)
+    except Exception:
+        return None, None
+
+def _upstash_post(commands):
+    """Send a pipeline POST to Upstash. commands = list of Redis command lists."""
+    import sys, traceback
+    try:
+        base_url, token = _upstash_credentials()
+        if not base_url:
+            print("[upstash] No credentials found in secrets.toml", file=sys.stderr)
+            return None
+        body = json.dumps(commands).encode("utf-8")
+        req  = urllib.request.Request(
+            base_url + "/pipeline",
+            data=body, method="POST",
+            headers={"Authorization": f"Bearer {token}",
+                     "Content-Type": "application/json"},
+        )
+        with urllib.request.urlopen(req, timeout=5) as r:
+            raw      = r.read().decode()
+            response = json.loads(raw)
+            # Log any Redis-level errors returned in the response
+            if isinstance(response, list):
+                for i, item in enumerate(response):
+                    if isinstance(item, dict) and item.get("error"):
+                        print(f"[upstash] Redis error on command {commands[i]}: {item['error']}", file=sys.stderr)
+            return response
+    except urllib.error.HTTPError as e:
+        body_text = e.read().decode(errors="replace")
+        print(f"[upstash] HTTP {e.code} {e.reason}: {body_text}", file=sys.stderr)
+        return None
+    except Exception as e:
+        print(f"[upstash] Unexpected error: {type(e).__name__}: {e}", file=sys.stderr)
+        traceback.print_exc(file=sys.stderr)
+        return None
+
+def _redis_get(key):
+    result = _upstash_post([["GET", key]])
+    if result and isinstance(result, list):
+        return result[0].get("result")   # str or None
+    return None
+
+def _redis_set(key, value, ex=None):
+    """value must be a plain str."""
+    import sys
+    cmd = ["SET", key, value]
+    if ex:
+        cmd += ["EX", str(ex)]
+    result = _upstash_post([cmd])
+    if result and isinstance(result, list):
+        status = result[0].get("result")
+        if status != "OK":
+            print(f"[upstash] SET {key!r} returned unexpected status: {status}", file=sys.stderr)
+
+def _redis_ping():
+    result = _upstash_post([["PING"]])
+    return bool(result)
+
+# ── BibTeX serialisation ──────────────────────────────────────────────────────
+
+def _msg_to_bibtex(doi, msg):
+    """
+    Convert a CrossRef message dict to a compact BibTeX string.
+    Stored value is small and human-readable in the Upstash Data Browser.
+    """
+    def _clean(s):
+        """Remove BibTeX special chars that would break parsing."""
+        return str(s).replace("{", "").replace("}", "").replace('"', "'").replace("\n", " ").strip()
+
+    # Authors: "Last, F. I. and Last2, F."
+    authors = msg.get("author", [])
+    author_parts = []
+    for a in authors:
+        family = a.get("family", a.get("name", ""))
+        given  = a.get("given", "")
+        initials = " ".join(p[0] + "." for p in given.split()) if given else ""
+        author_parts.append(f"{family}, {initials}".strip(", "))
+    author_str = " and ".join(author_parts) if author_parts else "Unknown"
+
+    title     = _clean((msg.get("title") or [""])[0])
+    journal   = _clean((msg.get("container-title") or msg.get("publisher") or [""])[0] if isinstance(msg.get("container-title") or msg.get("publisher"), list) else msg.get("container-title", msg.get("publisher", "")))
+    year      = ""
+    for field in ("published", "published-print", "published-online", "issued"):
+        dp = msg.get(field, {}).get("date-parts")
+        if dp and dp[0] and dp[0][0]:
+            year = str(dp[0][0]); break
+    volume    = _clean(msg.get("volume", ""))
+    number    = _clean(msg.get("issue", ""))
+    pages     = _clean(msg.get("page", ""))
+    publisher = _clean(msg.get("publisher", ""))
+
+    # Cite key: first author last name + year
+    first_family = (authors[0].get("family", "unknown") if authors else "unknown").lower()
+    first_family = re.sub(r"[^a-z0-9]", "", first_family)
+    cite_key = f"{first_family}{year}"
+
+    fields = [
+        f"  doi       = {{{doi}}}",
+        f"  title     = {{{title}}}",
+        f"  author    = {{{author_str}}}",
+        f"  journal   = {{{journal}}}",
+        f"  year      = {{{year}}}",
+    ]
+    if volume:    fields.append(f"  volume    = {{{volume}}}")
+    if number:    fields.append(f"  number    = {{{number}}}")
+    if pages:     fields.append(f"  pages     = {{{pages}}}")
+    if publisher: fields.append(f"  publisher = {{{publisher}}}")
+
+    return "@article{" + cite_key + ",\n" + ",\n".join(fields) + "\n}"
+
+
+def _bibtex_to_msg(bibtex_str):
+    """
+    Parse a stored BibTeX string back to a CrossRef-compatible dict.
+    Returns None if parsing fails.
+    """
+    try:
+        def _field(name):
+            m = re.search(r"" + name + r"\s*=\s*\{([^}]*)\}", bibtex_str, re.IGNORECASE)
+            return m.group(1).strip() if m else ""
+
+        doi       = _field("doi")
+        title     = _field("title")
+        journal   = _field("journal")
+        year      = _field("year")
+        volume    = _field("volume")
+        number    = _field("number")
+        pages     = _field("pages")
+        publisher = _field("publisher")
+        author_raw = _field("author")
+
+        # Parse authors: "Last, F. I. and Last2, F2." → list of dicts
+        authors = []
+        if author_raw:
+            for part in author_raw.split(" and "):
+                part = part.strip()
+                if "," in part:
+                    fam, giv = part.split(",", 1)
+                    authors.append({"family": fam.strip(), "given": giv.strip()})
+                elif part:
+                    authors.append({"family": part})
+
+        if not title and not authors:
+            return None
+
+        msg = {
+            "DOI":              doi,
+            "title":            [title] if title else [],
+            "author":           authors,
+            "container-title":  [journal] if journal else [],
+            "publisher":        publisher,
+            "volume":           volume,
+            "issue":            number,
+            "page":             pages,
+            "published":        {"date-parts": [[int(year)]]} if year.isdigit() else {},
+        }
+        return msg
+    except Exception:
+        return None
+
+
+# ── Cache read / write ────────────────────────────────────────────────────────
+
+def _doi_cache_key(doi):
+    return "bib:" + doi.strip().lower()
+
+def _cache_get_doi(doi):
+    """Return CrossRef-compatible dict from cache, or None."""
+    raw = _redis_get(_doi_cache_key(doi))
+    if not raw or not raw.strip().startswith("@"):
+        return None
+    return _bibtex_to_msg(raw)
+
+def _cache_set_doi(doi, msg):
+    """Convert msg to BibTeX and store under key bib:<doi>."""
+    import sys
+    if not isinstance(msg, dict):
+        print(f"[cache] _cache_set_doi skipped — msg is not a dict: {type(msg)}", file=sys.stderr)
+        return
+    try:
+        bibtex = _msg_to_bibtex(doi, msg)
+        key    = _doi_cache_key(doi)
+        _redis_set(key, bibtex)
+        # Verify write by reading back
+        stored = _redis_get(key)
+        if stored and stored.strip().startswith("@"):
+            print(f"[cache] ✓ Saved {key} ({len(bibtex)} bytes)", file=sys.stderr)
+        else:
+            print(f"[cache] ✗ Write failed for {key} — readback: {repr(stored)[:80]}", file=sys.stderr)
+    except Exception as e:
+        print(f"[cache] ✗ Exception in _cache_set_doi({doi}): {e}", file=sys.stderr)
+
+def _ascii_fold(s):
+    """Normalize unicode to ASCII for fuzzy matching (e.g. Ebenhöh → ebenh)."""
+    import unicodedata
+    return unicodedata.normalize("NFKD", s).encode("ascii", "ignore").decode("ascii").lower()
+
+def _fuzzy_cache_search(info):
+    """
+    Search the bib: cache for entries matching a fuzzy query.
+    Uses SCAN to iterate all bib: keys, then scores title/author/year matches.
+    Returns list of (doi, msg) tuples for top matches, or [].
+    """
+    import sys
+    try:
+        # SCAN all bib: keys
+        cursor   = "0"
+        bib_keys = []
+        for _ in range(20):
+            result = _upstash_post([["SCAN", cursor, "MATCH", "bib:*", "COUNT", "100"]])
+            if not result or not isinstance(result, list):
+                break
+            inner = result[0].get("result", [])
+            if not isinstance(inner, list) or len(inner) < 2:
+                break
+            cursor    = str(inner[0])
+            bib_keys += inner[1] if isinstance(inner[1], list) else []
+            if cursor == "0":
+                break
+
+        print(f"[fuzzy] SCAN found {len(bib_keys)} bib: keys", file=sys.stderr)
+        if not bib_keys:
+            return []
+
+        # Build clean search terms — only meaningful words, ASCII-folded
+        terms = []
+        for field in ("title", "author", "journal"):
+            v = info.get(field, "")
+            if v:
+                folded = _ascii_fold(v)
+                words  = re.sub(r"[^a-z0-9 ]", " ", folded).split()
+                # Keep only alphabetic words longer than 3 chars (skip DOI fragments, numbers)
+                terms += [w for w in words if len(w) > 3 and not w.isdigit() and re.search(r"[a-z]", w)]
+        year = str(info.get("year", ""))
+
+        # Deduplicate terms
+        terms = list(dict.fromkeys(terms))
+
+        print(f"[fuzzy] clean terms={terms} year={year!r}", file=sys.stderr)
+        if not terms:
+            return []
+
+        # Fetch all bib: values in one pipeline call
+        keys_to_fetch = bib_keys[:50]
+        cmds   = [["GET", k] for k in keys_to_fetch]
+        values = _upstash_post(cmds)
+        if not values:
+            return []
+
+        matches = []
+        for key, val_obj in zip(keys_to_fetch, values):
+            raw = val_obj.get("result", "") if isinstance(val_obj, dict) else ""
+            if not raw or not raw.strip().startswith("@"):
+                continue
+            # ASCII-fold the stored BibTeX for comparison
+            raw_folded = _ascii_fold(raw)
+            hit_count  = sum(1 for t in terms if t in raw_folded)
+            if year and year in raw:
+                hit_count += 2
+            # Need at least 2 meaningful term hits OR year + 1 term
+            threshold = max(2, len(terms) // 3)
+            if hit_count >= threshold:
+                doi = key[4:]   # strip "bib:" prefix
+                msg = _bibtex_to_msg(raw)
+                if msg:
+                    msg["_cache_score"] = hit_count
+                    matches.append((doi, msg))
+
+        matches.sort(key=lambda x: x[1].get("_cache_score", 0), reverse=True)
+        print(f"[fuzzy] → {len(matches)} match(es) from {len(keys_to_fetch)} keys", file=sys.stderr)
+        return matches[:3]
+    except Exception as e:
+        print(f"[cache] fuzzy search error: {e}", file=sys.stderr)
+        import traceback; traceback.print_exc(file=sys.stderr)
+        return []
+
+def _cache_stats():
+    if "cache_hits"   not in st.session_state: st.session_state.cache_hits   = 0
+    if "cache_misses" not in st.session_state: st.session_state.cache_misses = 0
+    return st.session_state.cache_hits, st.session_state.cache_misses
+
+# ── Cached wrappers ───────────────────────────────────────────────────────────
+
+def _ensure_dict(value, label=""):
+    if isinstance(value, dict) and value:
+        return value
+    import sys
+    print(f"[citeformat cache] WARNING: expected dict, got {type(value).__name__} {label!r}: {str(value)[:120]}", file=sys.stderr)
+    return None
+
+def cached_fetch_by_doi(doi):
+    """fetch_by_doi with Redis cache. Returns (msg, raw_doi)."""
+    raw    = doi.strip().lstrip("https://doi.org/").lstrip("http://dx.doi.org/")
+    cached = _cache_get_doi(raw)
+    if cached is not None:
+        validated = _ensure_dict(cached, f"doi:{raw}")
+        if validated is not None:
+            st.session_state.cache_hits = st.session_state.get("cache_hits", 0) + 1
+            return validated, raw
+        # Cache returned bad data — delete it and fall through to live fetch
+        _redis_set("bib:" + raw.strip().lower(), "")
+    st.session_state.cache_misses = st.session_state.get("cache_misses", 0) + 1
+    msg, rd = fetch_by_doi(doi)
+    # Don't cache here — caller does it explicitly to avoid double writes
+    return msg, rd
+
+# search_crossref is called directly — no search-level caching
 
 # ── Import all logic from citeformat.py (must be in the same folder) ─────────
 try:
@@ -285,6 +629,26 @@ with st.sidebar:
         unsafe_allow_html=True,
     )
 
+    # Cache stats
+    hits, misses = _cache_stats()
+    if hits + misses > 0:
+        pct = int(100 * hits / (hits + misses))
+        st.markdown("---")
+        st.markdown(
+            f"<span style='color:#78716c;font-size:0.75rem;'>"
+            f"Cache: {hits} hits · {misses} misses · {pct}% saved"
+            f"</span>",
+            unsafe_allow_html=True,
+        )
+    elif _redis_ping():
+        st.markdown("---")
+        st.markdown(
+            "<span style='color:#78716c;font-size:0.75rem;'>"
+            "Cache: connected ✓"
+            "</span>",
+            unsafe_allow_html=True,
+        )
+
 
 # =============================================================================
 # MAIN AREA
@@ -390,11 +754,15 @@ def _process_all_auto(lines, fmt_fn, fmt_label):
     progress = st.progress(0, text="Looking up references…")
 
     for i, line in enumerate(lines):
-        progress.progress((i) / len(lines), text=f"Processing {i+1}/{len(lines)}: {line[:50]}…")
         info = detect_input_type(line)
+        cached_hit = bool(_cache_get_doi(
+            info["doi"].strip().lstrip("https://doi.org/").lstrip("http://dx.doi.org/")
+        )) if info.get("type") == "doi" else False
+        source_label = "cache" if cached_hit else "CrossRef"
+        progress.progress((i) / len(lines), text=f"{i+1}/{len(lines)} · {source_label} · {line[:45]}…")
 
         if info["type"] == "doi":
-            msg, raw_doi = fetch_by_doi(info["doi"])
+            msg, raw_doi = cached_fetch_by_doi(info["doi"])
             if msg:
                 doi_key = raw_doi.strip().lower()
                 if doi_key in seen_dois:
@@ -415,28 +783,30 @@ def _process_all_auto(lines, fmt_fn, fmt_label):
             elif len(candidates) == 1:
                 c       = candidates[0]
                 raw_doi = c.get("DOI", "")
-                doi_key = raw_doi.strip().lower()
-                if doi_key and doi_key in seen_dois:
+                dk      = raw_doi.strip().lower()
+                if dk and dk in seen_dois:
                     entries.append((f"[Duplicate: {line}]", []))
                 else:
-                    full, rd = fetch_by_doi(raw_doi)
-                    msg     = full if full else c
+                    full, rd = cached_fetch_by_doi(raw_doi)
+                    msg     = _ensure_dict(full) or _ensure_dict(c)
                     rd      = rd  if rd   else raw_doi
+                    if msg is None:
+                        entries.append((f"[Could not retrieve: {line}]", []))
+                        continue
                     if rd:
                         seen_dois[rd.strip().lower()] = line
+                        _cache_set_doi(rd, msg)
                     authors_meta = msg.get("author", [])
                     entries.append((fmt_fn(msg, rd, idx), authors_meta))
                     idx += 1
             else:
-                # Need user to pick — store placeholder, resolve later
-                # Pass seen_dois so candidate resolution can check too
                 ambiguous.append({
                     "line":       line,
                     "entry_idx":  idx,
                     "list_pos":   len(entries),
                     "candidates": candidates,
                 })
-                entries.append(None)         # placeholder
+                entries.append(None)
                 idx += 1
 
     progress.empty()
@@ -476,7 +846,7 @@ if run_clicked:
             with st.expander(f"⚠ {len(duplicates)} duplicate(s) removed before processing"):
                 for d in duplicates:
                     st.markdown(f"- `{d}`")
-        with st.spinner("Querying CrossRef…"):
+        with st.spinner("Looking up references…"):
             entries, ambiguous = _process_all_auto(lines, formatter, chosen_fmt_label)
         st.session_state.entries   = entries
         st.session_state.ambiguous = ambiguous
@@ -495,9 +865,13 @@ if st.session_state.get("ambiguous") and not st.session_state.done:
     pending   = [a for a in ambiguous if st.session_state.entries[a["list_pos"]] is None]
 
     if pending:
-        item = pending[0]
+        item      = pending[0]
+        fmt_fn    = st.session_state.formatter
+        entry_idx = item["entry_idx"]
+        seen_dois = st.session_state.get("seen_dois", {})
+
         st.markdown("---")
-        st.markdown(f"### 🔍 Ambiguous match — please pick one")
+        st.markdown("### 🔍 Ambiguous match — please pick one")
         st.markdown(
             f"<span style='color:#78716c;'>Query: <code>{item['line']}</code></span>",
             unsafe_allow_html=True,
@@ -522,31 +896,31 @@ if st.session_state.get("ambiguous") and not st.session_state.done:
                 col_card, col_btn = st.columns([5, 1])
                 with col_card:
                     st.markdown(f"**{auth_str}** ({year})")
-                    st.markdown(f"{title}")
+                    st.markdown(title)
                     st.caption(f"{journal} · score {score:.0f} · {doi}")
                 with col_btn:
-                    st.write("")  # vertical alignment spacer
+                    st.write("")
                     if st.button("Select", key=f"pick_{item['list_pos']}_{n}"):
-                        raw_doi   = c.get("DOI", "")
-                        doi_key   = raw_doi.strip().lower()
-                        seen_dois = st.session_state.get("seen_dois", {})
-                        fmt_fn    = st.session_state.formatter
-                        entry_idx = item["entry_idx"]
+                        raw_doi = c.get("DOI", "")
+                        doi_key = raw_doi.strip().lower()
                         if doi_key and doi_key in seen_dois:
                             st.session_state.entries[item["list_pos"]] = (
                                 f"[Duplicate: {item['line']}]", []
                             )
                         else:
-                            full, rd = fetch_by_doi(raw_doi)
-                            msg      = full if full else c
-                            rd       = rd   if rd   else raw_doi
+                            full, rd = cached_fetch_by_doi(raw_doi)
+                            msg      = _ensure_dict(full) or _ensure_dict(c)
+                            rd       = rd if rd else raw_doi
+                            if msg is None:
+                                st.error(f"Could not retrieve metadata for {raw_doi}. Please try again.")
+                                st.stop()
                             authors_meta = msg.get("author", [])
                             if rd:
                                 seen_dois[rd.strip().lower()] = item["line"]
-                                st.session_state.seen_dois = seen_dois
+                                st.session_state.seen_dois    = seen_dois
+                                _cache_set_doi(rd, msg)
                             st.session_state.entries[item["list_pos"]] = (
-                                fmt_fn(msg, rd, entry_idx),
-                                authors_meta,
+                                fmt_fn(msg, rd, entry_idx), authors_meta
                             )
                         st.rerun()
 
@@ -627,7 +1001,7 @@ if _all_resolved:
     # ── Download buttons ──────────────────────────────────────────────────────
     st.markdown(" ")
     st.markdown("**Download**")
-    dl_cols = st.columns(3)
+    dl_cols = st.columns(4)
 
     # Markdown
     with dl_cols[0]:
@@ -674,5 +1048,31 @@ if _all_resolved:
             pdf_bytes,
             file_name="references.pdf",
             mime="application/pdf",
+            use_container_width=True,
+        )
+
+    # BibTeX — fetch stored bib: entries from Redis by resolved DOIs
+    with dl_cols[3]:
+        seen_dois = st.session_state.get("seen_dois", {})
+        bib_parts = []
+        if seen_dois:
+            # Fetch all bib: entries in one pipeline call
+            doi_list = list(seen_dois.keys())
+            cmds     = [["GET", _doi_cache_key(d)] for d in doi_list]
+            results  = _upstash_post(cmds) or []
+            for doi, res in zip(doi_list, results):
+                raw = res.get("result", "") if isinstance(res, dict) else ""
+                if raw and raw.strip().startswith("@"):
+                    bib_parts.append(raw.strip())
+                else:
+                    # Not in cache — generate minimal entry from DOI
+                    cite_key = re.sub(r"[^a-z0-9]", "", doi.split("/")[-1].lower())
+                    bib_parts.append("@article{" + cite_key + ",\n  doi = {" + doi + "}\n}")
+        bib_content = "% Generated by CiteFormat\n\n" + "\n\n".join(bib_parts)
+        st.download_button(
+            "⬇ BibTeX",
+            bib_content.encode("utf-8"),
+            file_name="references.bib",
+            mime="text/plain",
             use_container_width=True,
         )
